@@ -173,7 +173,7 @@ def upload_or_move(job, work_dir, input_args, output):
         # get output path and
         output_dir = input_args['output_dir']
         # FIXME: undefined function
-        make_directory(output_dir)
+        mkdir_p(output_dir)
         move_to_output_dir(work_dir, output_dir, output)
 
     elif input_args['s3_dir']:
