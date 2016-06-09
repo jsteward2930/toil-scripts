@@ -31,8 +31,8 @@ import logging
 import errno
 from toil.job import Job
 
-from toil_scripts import download_from_s3_url
-from toil_scripts.lib.urls import s3am_upload
+from toil_scripts.lib.files import mkdir_p
+from toil_scripts.lib.urls import download_url_job, s3am_upload
 from toil_scripts.lib.programs import docker_call
 
 _log = logging.getLogger(__name__)
@@ -60,19 +60,6 @@ def build_parser():
     return parser
 
 # Convenience functions used in the pipeline
-def mkdir_p(path):
-    """
-    It is Easier to Ask for Forgiveness than Permission
-    """
-    try:
-        os.makedirs(path)
-    except OSError as exc:
-        if exc.errno == errno.EEXIST and os.path.isdir(path):
-            pass
-        else:
-            raise
-
-
 def flatten(x):
     """
     Flattens a nested array into a single list
@@ -104,36 +91,7 @@ def generate_unique_key(master_key_path, url):
     return new_key
 
 
-def download_encrypted_file(job, input_args, name):
-    """
-    Downloads encrypted files from S3 via header injection
-
-    input_args: dict    Input dictionary defined in main()
-    name: str           Symbolic name associated with file
-    """
-    work_dir = job.fileStore.getLocalTempDir()
-    key_path = input_args['ssec']
-    file_path = os.path.join(work_dir, name)
-    url = input_args[name]
-    with open(key_path, 'r') as f:
-        key = f.read()
-    if len(key) != 32:
-        raise RuntimeError('Invalid Key! Must be 32 bytes: {}'.format(key))
-    key = generate_unique_key(key_path, url)
-    encoded_key = base64.b64encode(key)
-    encoded_key_md5 = base64.b64encode(hashlib.md5(key).digest())
-    h1 = 'x-amz-server-side-encryption-customer-algorithm:AES256'
-    h2 = 'x-amz-server-side-encryption-customer-key:{}'.format(encoded_key)
-    h3 = 'x-amz-server-side-encryption-customer-key-md5:{}'.format(encoded_key_md5)
-    try:
-        subprocess.check_call(['curl', '-fs', '--retry', '5', '-H', h1, '-H', h2, '-H', h3, url, '-o', file_path])
-    except OSError:
-        raise RuntimeError('Failed to find "curl". Install via "apt-get install curl"')
-    assert os.path.exists(file_path)
-    return job.fileStore.writeGlobalFile(file_path)
-
-
-def move_to_output_dir(work_dir, output_dir, *filenames):
+def copy_to_output_dir(work_dir, output_dir, *filenames):
     """
     Moves files from the working directory to the output directory.
 
@@ -145,26 +103,11 @@ def move_to_output_dir(work_dir, output_dir, *filenames):
         origin = os.path.join(work_dir, filename)
         dest = os.path.join(output_dir, filename)
         try:
-            shutil.move(origin, dest)
+            shutil.copy(origin, dest)
         except IOError:
             mkdir_p(output_dir)
-            shutil.move(origin, dest)
+            shutil.copy(origin, dest)
 
-
-def copy_to_output_dir(work_dir, output_dir, uuid=None, files=None):
-    """
-    A list of files to move from work_dir to output_dir.
-
-    work_dir: str       Current working directory
-    output_dir: str     Output directory for files to go
-    uuid: str           UUID to "stamp" onto output files
-    files: list         List of files to iterate through
-    """
-    for fname in files:
-        if uuid is None:
-            shutil.copy(os.path.join(work_dir, fname), os.path.join(output_dir, fname))
-        else:
-            shutil.copy(os.path.join(work_dir, fname), os.path.join(output_dir, '{}.{}'.format(uuid, fname)))
 
 def upload_or_move(job, work_dir, input_args, output):
 
@@ -172,9 +115,8 @@ def upload_or_move(job, work_dir, input_args, output):
     if input_args['output_dir']:
         # get output path and
         output_dir = input_args['output_dir']
-        # FIXME: undefined function
         mkdir_p(output_dir)
-        move_to_output_dir(work_dir, output_dir, output)
+        copy_to_output_dir(work_dir, output_dir, output)
 
     elif input_args['s3_dir']:
         s3am_upload(fpath=os.path.join(work_dir, output),
@@ -184,39 +126,8 @@ def upload_or_move(job, work_dir, input_args, output):
     else:
         raise ValueError('No output_directory or s3_dir defined. Cannot determine where to store %s' % output)
 
-def download_from_url_gatk(job, url, name):
-    """
-    Simple curl request made for a given url
 
-    url: str    URL to download
-    name: str   Name to give downloaded file
-    """
-    work_dir = job.fileStore.getLocalTempDir()
-    file_path = os.path.join(work_dir, name)
-    if not os.path.exists(file_path):
-        if url.startswith('s3:'):
-            download_from_s3_url(file_path, url)
-        else:
-            try:
-                if debug:
-                    debug_log = open('download_from_url', 'a')
-                    debug_log.write(file_path + '\n')
-                    debug_log.close()
-                    f = open(file_path, 'w')
-                    f.write('debug')
-                    f.close()
-                else:
-                    subprocess.check_call(['curl', '-fs', '--retry', '5', '--create-dir', url, '-o', file_path])
-            except subprocess.CalledProcessError:
-                raise RuntimeError(
-                    '\nNecessary file could not be acquired: {}. Check input URL'.format(url))
-            except OSError:
-                raise RuntimeError('Failed to find "curl". Install via "apt-get install curl"')
-    assert os.path.exists(file_path)
-    return job.fileStore.writeGlobalFile(file_path)
-
-
-def return_input_paths(job, work_dir, ids, *args):
+def get_files_from_filestore(job, work_dir, ids, *args):
     """
     Given one or more strings representing file_names, return the paths to those files. Each item must be unpacked!
 
@@ -237,20 +148,6 @@ def return_input_paths(job, work_dir, ids, *args):
     return paths
 
 
-def read_from_filestore(job, work_dir, ids, *filenames):
-    """
-    Reads file from fileStore and writes it to working directory.
-
-    :param job: Job instance
-    :param work_dir: working directory
-    :param ids: shared file promises, dict
-    :param filenames: remaining arguments are filenames
-    """
-    for filename in filenames:
-        if not os.path.exists(os.path.join(work_dir, filename)):
-            job.fileStore.readGlobalFile(ids[filename], os.path.join(work_dir, filename))
-
-
 def docker_path(file_path):
     """
     Returns the path internal to the docker container (for standard reasons, this is always /data)
@@ -258,7 +155,7 @@ def docker_path(file_path):
     return os.path.join('/data', os.path.basename(file_path))
 
 
-def create_reference_index(job, ref_id, sudo):
+def create_reference_index(job, ref_id):
     """
     Uses Samtools to create reference index file (.fasta.fai)
 
@@ -298,7 +195,6 @@ def create_reference_dict(job, ref_id, input_args):
     ref_id: str     The fileStore ID of the reference
     input_args: dict        Dictionary of input arguments (from main())
     """
-    sudo = input_args['sudo']
     work_dir = job.fileStore.getLocalTempDir()
     # Retrieve file path
     ref_path = job.fileStore.readGlobalFile(ref_id, os.path.join(work_dir, 'ref.fa'))
@@ -308,13 +204,11 @@ def create_reference_dict(job, ref_id, input_args):
                 env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']},
                 tool='quay.io/ucsc_cgl/picardtools:1.95--dd5ac549b95eb3e5d166a5e310417ef13651994e',
                 inputs=['ref.fa'],
-                outputs={'ref.dict': None},
-                sudo=sudo)
+                outputs={'ref.dict': None})
     # Write to fileStore
     return job.fileStore.writeGlobalFile(os.path.join(work_dir, 'ref.dict'))
 
 
-# TODO Start of Pipeline
 def download_gatk_files(job, input_args):
     """
     Downloads files shared by all samples in the pipeline
@@ -324,7 +218,8 @@ def download_gatk_files(job, input_args):
     
     shared_ids = {}
     for fname in ['ref.fa', 'phase.vcf', 'mills.vcf', 'dbsnp.vcf']:
-        shared_ids[fname] = job.addChildJobFn(download_from_url_gatk, url=input_args[fname], name=fname).rv()
+        shared_ids[fname] = job.addChildJobFn(download_url_job, url=input_args[fname], name=fname,
+                                              s3_key_path=input_args['ssec']).rv()
     job.addFollowOnJobFn(reference_preprocessing, shared_ids, input_args)
 
 
@@ -386,17 +281,15 @@ def download_sample(job, shared_ids, input_args, sample):
     if input_args['output_dir']:
         input_args['output_dir'] = os.path.join(input_args['output_dir'], uuid)
     # Download sample bams and launch pipeline
-    if input_args['ssec']:
-        shared_ids['sample.bam'] = job.addChildJobFn(download_encrypted_file, input_args, 'sample.bam').rv()
-    else:
-        shared_ids['sample.bam'] = job.addChildJobFn(download_from_url_gatk, url=url, name='sample.bam').rv()
+    shared_ids['sample.bam'] = job.addChildJobFn(download_url_job, url=url, name='sample.bam',
+                                                 s3_key_path=input_args['ssec']).rv()
     job.addFollowOnJobFn(remove_supplementary_alignments, shared_ids, input_args)
 
 def remove_supplementary_alignments(job, shared_ids, input_args):
     work_dir = job.fileStore.getLocalTempDir()
 
     #Retrieve file path
-    read_from_filestore(job, work_dir, shared_ids, 'sample.bam')
+    get_files_from_filestore(job, work_dir, shared_ids, 'sample.bam')
     outpath = os.path.join(work_dir, 'sample.nosuppl.bam')
 
     command = ['view',
@@ -404,7 +297,6 @@ def remove_supplementary_alignments(job, shared_ids, input_args):
                '-F', '0x800',
                '/data/sample.bam']
                
-    sudo = input_args['sudo']
     docker_call(work_dir=work_dir, parameters=command,
                 tool='quay.io/ucsc_cgl/samtools:1.3--256539928ea162949d8a65ca5c79a72ef557ce7c',
                 inputs=['sample.bam'],
@@ -426,7 +318,7 @@ def sort_sample(job, shared_ids, input_args):
     work_dir = job.fileStore.getLocalTempDir()
 
     #Retrieve file path
-    read_from_filestore(job, work_dir, shared_ids, 'sample.nosuppl.bam')
+    get_files_from_filestore(job, work_dir, shared_ids, 'sample.nosuppl.bam')
     outpath = os.path.join(work_dir, 'sample.sorted.bam')
     #Call: picardtools
     command = ['SortSam',
@@ -439,8 +331,7 @@ def sort_sample(job, shared_ids, input_args):
                 env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']},
                 tool='quay.io/ucsc_cgl/picardtools:1.95--dd5ac549b95eb3e5d166a5e310417ef13651994e',
                 inputs=['sample.nosuppl.bam'],
-                outputs={'sample.sorted.bam': None, 'sample.sorted.bai': None},
-                sudo=sudo)
+                outputs={'sample.sorted.bam': None, 'sample.sorted.bai': None})
     shared_ids['sample.sorted.bam'] = job.fileStore.writeGlobalFile(outpath)
     job.addChildJobFn(mark_dups_sample, shared_ids, input_args)
 
@@ -449,10 +340,9 @@ def mark_dups_sample(job, shared_ids, input_args):
     """
     Uses picardtools MarkDuplicates
     """
-    sudo = input_args['sudo']
     work_dir = job.fileStore.getLocalTempDir()
     # Retrieve file path
-    read_from_filestore(job, work_dir, shared_ids, 'sample.sorted.bam')
+    get_files_from_filestore(job, work_dir, shared_ids, 'sample.sorted.bam')
     outpath = os.path.join(work_dir, 'sample.mkdups.bam')
     # Call: picardtools
     command = ['MarkDuplicates',
@@ -482,18 +372,16 @@ def realigner_target_creator(job, shared_ids, input_args):
     sample: str         Either "normal" or "tumor" to track which one is which
     """
     work_dir = job.fileStore.getLocalTempDir()
-    sudo = input_args['sudo']
+    cores = multiprocessing.cpu_count()
     # Retrieve input file paths
-    read_from_filestore(job, work_dir, shared_ids, 'ref.fa',
-                        'sample.mkdups.bam', 'ref.fa.fai', 'ref.dict',
-                        'sample.mkdups.bam.bai', 'phase.vcf', 'mills.vcf')
-
+    inputs = ['ref.fa','ref.fa.fai', 'ref.dict', 'phase.vcf', 'mills.vcf','sample.mkdups.bam', 'sample.mkdups.bam.bai']
+    get_files_from_filestore(job, work_dir, shared_ids, *inputs)
     # Output file path
     output = os.path.join(work_dir, 'sample.intervals')
     # Call: GATK -- RealignerTargetCreator
     parameters = ['-U', 'ALLOW_SEQ_DICT_INCOMPATIBILITY', # RISKY! (?) See #189
                   '-T', 'RealignerTargetCreator',
-                  '-nt', str(input_args['cpu_count']),
+                  '-nt', str(cores),
                   '-R', 'ref.fa',
                   '-I', 'sample.mkdups.bam',
                   '-known', 'phase.vcf',
@@ -503,11 +391,9 @@ def realigner_target_creator(job, shared_ids, input_args):
 
     docker_call(work_dir=work_dir, parameters=parameters,
                 tool='quay.io/ucsc_cgl/gatk:3.5--dba6dae49156168a909c43330350c6161dc7ecc2',
-                inputs=['ref.fa','sample.mkdups.bam', 'ref.fa.fai', 'ref.dict',
-                        'sample.mkdups.bam.bai', 'phase.vcf', 'mills.vcf'],
+                inputs=inputs,
                 outputs={'sample.intervals': None},
-                env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']},
-                sudo=sudo)
+                env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']})
     shared_ids['sample.intervals'] = job.fileStore.writeGlobalFile(output)
     job.addChildJobFn(indel_realignment, shared_ids, input_args)
 
@@ -521,12 +407,10 @@ def indel_realignment(job, shared_ids, input_args):
     """
     # Unpack convenience variables for job
     work_dir = job.fileStore.getLocalTempDir()
-    sudo = input_args['sudo']
     # Retrieve input file paths
-    return_input_paths(job, work_dir, shared_ids, 'ref.fa',
-                       'sample.mkdups.bam', 'phase.vcf', 'mills.vcf',
-                       'sample.intervals', 'ref.fa.fai', 'ref.dict',
-                       'sample.mkdups.bam.bai')
+    inputs = ['ref.fa','ref.fa.fai', 'ref.dict', 'phase.vcf', 'mills.vcf','sample.mkdups.bam', 'sample.mkdups.bam.bai',
+              'sample.intervals']
+    get_files_from_filestore(job, work_dir, shared_ids, *inputs)
     # Output file path
     outpath = os.path.join(work_dir, 'sample.indel.bam')
     # Call: GATK -- IndelRealigner
@@ -544,9 +428,7 @@ def indel_realignment(job, shared_ids, input_args):
 
     docker_call(tool='quay.io/ucsc_cgl/gatk:3.5--dba6dae49156168a909c43330350c6161dc7ecc2',
                 work_dir=work_dir, parameters=parameters,
-                inputs=['ref.fa', 'sample.mkdups.bam', 'phase.vcf', 'mills.vcf',
-                        'sample.intervals', 'ref.fa.fai', 'ref.dict',
-                        'sample.mkdups.bam.bai'],
+                inputs=inputs,
                 outputs={'sample.indel.bam': None, 'sample.indel.bai': None},
                 env={'JAVA_OPTS':'-Xmx10g'})
 
@@ -564,32 +446,30 @@ def base_recalibration(job, shared_ids, input_args):
     job_vars: tuple     Contains the input_args and ids dictionaries
     sample: str         Either "normal" or "tumor" to track which one is which
     """
-    # Unpack convenience variables for job
     work_dir = job.fileStore.getLocalTempDir()
-    sudo = input_args['sudo']
+    cores = multiprocessing.cpu_count()
     # Retrieve input file paths
-    return_input_paths(job, work_dir, shared_ids, 'ref.fa', 'sample.indel.bam',
-                       'dbsnp.vcf', 'ref.fa.fai',
-                       'ref.dict', 'sample.indel.bam.bai')
+    inputs = ['ref.fa', 'ref.fa.fai', 'ref.dict', 'dbsnp.vcf', 'sample.indel.bam', 'sample.indel.bam.bai']
+    get_files_from_filestore(job, work_dir, shared_ids, *inputs)
     # Output file path
     output = os.path.join(work_dir, 'sample.recal.table')
+
     # Call: GATK -- IndelRealigner
     parameters = ['-U', 'ALLOW_SEQ_DICT_INCOMPATIBILITY', # RISKY! (?) See #189
                   '-T', 'BaseRecalibrator',
-                  '-nct', str(input_args['cpu_count']),
+                  '-nct', str(cores),
                   '-R', 'ref.fa',
                   '-I', 'sample.indel.bam',
                   '-knownSites', 'dbsnp.vcf',
                   '-o', 'sample.recal.table']
     docker_call(tool='quay.io/ucsc_cgl/gatk:3.5--dba6dae49156168a909c43330350c6161dc7ecc2',
                 work_dir=work_dir, parameters=parameters,
-                inputs=['ref.fa', 'sample.indel.bam', 'dbsnp.vcf', 'ref.fa.fai',
-                        'ref.dict', 'sample.indel.bam.bai'],
+                inputs=inputs,
                 outputs={'sample.recal.table': None},
-                env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']}, sudo=sudo)
+                env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']})
     # Write to fileStore
     shared_ids['sample.recal.table'] = job.fileStore.writeGlobalFile(output)
-    job.addChildJobFn(print_reads, shared_ids, input_args, cores = input_args['cpu_count'])
+    job.addChildJobFn(print_reads, shared_ids, input_args, cores = cores)
 
 
 def print_reads(job, shared_ids, input_args):
@@ -603,10 +483,10 @@ def print_reads(job, shared_ids, input_args):
     uuid = input_args['uuid']
     suffix = input_args['suffix']
     work_dir = job.fileStore.getLocalTempDir()
-    sudo = input_args['sudo']
+    cores = multiprocessing.cpu_count()
     # Retrieve input file paths
-    return_input_paths(job, work_dir, shared_ids, 'ref.fa', 'sample.indel.bam',
-                       'ref.fa.fai', 'ref.dict', 'sample.indel.bam.bai', 'sample.recal.table')
+    inputs = ['ref.fa', 'ref.fa.fai', 'ref.dict', 'sample.indel.bam', 'sample.indel.bam.bai', 'sample.recal.table']
+    get_files_from_filestore(job, work_dir, shared_ids, *inputs)
     # Output file
     outfile = '{}{}.bam'.format(uuid, suffix)
     gatk_outfile_idx = '{}{}.bai'.format(uuid, suffix)
@@ -615,7 +495,7 @@ def print_reads(job, shared_ids, input_args):
     # Call: GATK -- PrintReads
     parameters = ['-U', 'ALLOW_SEQ_DICT_INCOMPATIBILITY', # RISKY! (?) See #189
                   '-T', 'PrintReads',
-                  '-nct', str(input_args['cpu_count']),
+                  '-nct', str(cores),
                   '-R', 'ref.fa',
                   '--emit_original_quals',
                   '-I', 'sample.indel.bam',
@@ -623,8 +503,7 @@ def print_reads(job, shared_ids, input_args):
                   '-o', outfile]
     docker_call(tool='quay.io/ucsc_cgl/gatk:3.5--dba6dae49156168a909c43330350c6161dc7ecc2',
                 work_dir=work_dir, parameters=parameters,
-                inputs=['ref.fa', 'sample.indel.bam', 'ref.fa.fai', 'ref.dict', 
-                        'sample.indel.bam.bai', 'sample.recal.table'],
+                inputs=inputs,
                 outputs={outfile: None, gatk_outfile_idx: None},
                 env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']})
     
@@ -648,10 +527,8 @@ def main():
               'dbsnp.vcf': pargs.dbsnp,
               'output_dir': pargs.output_dir,
               's3_dir': pargs.s3_dir,
-              'sudo': pargs.sudo,
               'ssec': pargs.ssec,
               'suffix': pargs.suffix,
-              'cpu_count': multiprocessing.cpu_count(), # FIXME: should not be called from toil-leader, see #186
               'memory': '15'}
 
     # Launch Pipeline
