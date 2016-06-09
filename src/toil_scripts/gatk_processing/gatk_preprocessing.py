@@ -54,9 +54,6 @@ def build_parser():
     parser.add_argument('-3', '--s3_dir', default=None, help='S3 Directory, starting with bucket name. e.g.: '
                                                              'cgl-driver-projects/ckcc/rna-seq-samples/')
     parser.add_argument('-x', '--suffix', default=".bqsr", help='additional suffix, if any')
-    parser.add_argument('-u', '--sudo', dest='sudo', action='store_true', help='Docker usually needs sudo to execute '
-                                                                               'locally, but not''when running Mesos '
-                                                                               'or when a member of a Docker group.')
     return parser
 
 # Convenience functions used in the pipeline
@@ -160,7 +157,6 @@ def create_reference_index(job, ref_id):
     Uses Samtools to create reference index file (.fasta.fai)
 
     ref_id: str     The fileStore ID of the reference
-    sudo: bool      Boolean item to determine whether to invoke sudo with docker
     """
     work_dir = job.fileStore.getLocalTempDir()
     # Retrieve file path to reference
@@ -235,8 +231,7 @@ def reference_preprocessing(job, shared_ids, input_args):
         sys.stderr.write("shared_ids['ref.fa'] is a dict. %s['ref_id'] = %s." % (shared_ids, ref_id))
         ref_id = ref_id['ref.fa']
 
-    sudo = input_args['sudo']
-    shared_ids['ref.fa.fai'] = job.addChildJobFn(create_reference_index, ref_id, sudo).rv()
+    shared_ids['ref.fa.fai'] = job.addChildJobFn(create_reference_index, ref_id).rv()
     shared_ids['ref.dict'] = job.addChildJobFn(create_reference_dict, ref_id, input_args).rv()
     job.addFollowOnJobFn(spawn_batch_preprocessing, shared_ids, input_args)
 
@@ -326,7 +321,6 @@ def sort_sample(job, shared_ids, input_args):
                'OUTPUT=sample.sorted.bam',
                'SORT_ORDER=coordinate',
                'CREATE_INDEX=true']
-    sudo = input_args['sudo']
     docker_call(work_dir=work_dir, parameters=command,
                 env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']},
                 tool='quay.io/ucsc_cgl/picardtools:1.95--dd5ac549b95eb3e5d166a5e310417ef13651994e',
@@ -361,7 +355,7 @@ def mark_dups_sample(job, shared_ids, input_args):
     # picard writes the index for file.bam at file.bai, not file.bam.bai
     _move_bai(outpath)
     shared_ids['sample.mkdups.bam.bai'] = job.fileStore.writeGlobalFile(outpath + ".bai")
-    job.addChildJobFn(realigner_target_creator, shared_ids, input_args, cores = input_args['cpu_count'])
+    job.addChildJobFn(realigner_target_creator, shared_ids, input_args, cores = multiprocess.cpu_count())
 
 
 def realigner_target_creator(job, shared_ids, input_args):
@@ -436,7 +430,7 @@ def indel_realignment(job, shared_ids, input_args):
     shared_ids['sample.indel.bam'] = job.fileStore.writeGlobalFile(outpath)
     _move_bai(outpath)
     shared_ids['sample.indel.bam.bai'] = job.fileStore.writeGlobalFile(outpath + ".bai")
-    job.addChildJobFn(base_recalibration, shared_ids, input_args, cores = input_args['cpu_count'])
+    job.addChildJobFn(base_recalibration, shared_ids, input_args, cores = multiprocess.cpu_count())
 
 
 def base_recalibration(job, shared_ids, input_args):
