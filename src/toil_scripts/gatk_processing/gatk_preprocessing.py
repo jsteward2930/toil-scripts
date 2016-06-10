@@ -44,12 +44,12 @@ def build_parser():
     Contains argparse arguments
     """
     parser = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('-r', '--reference', required=True, help="Reference Genome URL")
     parser.add_argument('-f', '--config', required=True, help="Each line contains (CSV): UUID, BAM_URL")
+    parser.add_argument('-o', '--output_dir', required=True, help='Full path to final output dir')
+    parser.add_argument('-g', '--genome', required=True, help="Reference Genome URL")
     parser.add_argument('-p', '--phase', required=True, help='1000G_phase1.indels.hg19.sites.fixed.vcf URL')
     parser.add_argument('-m', '--mills', required=True, help='Mills_and_1000G_gold_standard.indels.hg19.sites.vcf URL')
     parser.add_argument('-d', '--dbsnp', required=True, help='dbsnp_132_b37.leftAligned.vcf URL')
-    parser.add_argument('-o', '--output_dir', default=None, help='Full path to final output dir')
     parser.add_argument('-s', '--ssec', help='A key that can be used to fetch encrypted data')
     parser.add_argument('-3', '--s3_dir', default=None, help='S3 Directory, starting with bucket name. e.g.: '
                                                              'cgl-driver-projects/ckcc/rna-seq-samples/')
@@ -104,6 +104,9 @@ def copy_to_output_dir(work_dir, output_dir, *filenames):
         except IOError:
             mkdir_p(output_dir)
             shutil.copy(origin, dest)
+    f = open('copy_log', 'a')
+    f.write('Copied: {}\nDest: {}\n'.format(origin, dest))
+    f.close()
 
 
 def upload_or_move(job, work_dir, input_args, output):
@@ -141,7 +144,6 @@ def get_files_from_filestore(job, work_dir, ids, *args):
         paths[name] = file_path
         if len(args) == 1:
             paths = file_path
-
     return paths
 
 
@@ -211,12 +213,18 @@ def download_gatk_files(job, input_args):
 
     input_args: dict        Dictionary of input arguments (from main())
     """
-    
     shared_ids = {}
     for fname in ['ref.fa', 'phase.vcf', 'mills.vcf', 'dbsnp.vcf']:
         shared_ids[fname] = job.addChildJobFn(download_url_job, url=input_args[fname], name=fname,
                                               s3_key_path=input_args['ssec']).rv()
+        job.addFollowOnJobFn(save_file, shared_ids[fname], fname, input_args)
     job.addFollowOnJobFn(reference_preprocessing, shared_ids, input_args)
+
+def save_file(job, fileStoreID, fname, input_args): 
+    work_dir = job.fileStore.getLocalTempDir()
+    work_path = os.path.join(work_dir, fname)
+    job.fileStore.readGlobalFile(fileStoreID, work_path)
+    upload_or_move(job, work_dir, input_args, fname)
 
 
 def reference_preprocessing(job, shared_ids, input_args):
@@ -238,7 +246,7 @@ def reference_preprocessing(job, shared_ids, input_args):
 
 def spawn_batch_preprocessing(job, shared_ids, input_args):
     """
-    Spawn a pipeline for each sample in the configuration file
+    Spawn pipeline for each sample in the configuration file
 
     input_args: dict        Dictionary of input argumnets
     shared_ids: dict        Dictionary of fileStore IDs
@@ -275,10 +283,11 @@ def download_sample(job, shared_ids, input_args, sample):
     input_args['uuid'] = uuid
     if input_args['output_dir']:
         input_args['output_dir'] = os.path.join(input_args['output_dir'], uuid)
-    # Download sample bams and launch pipeline
+    # Downoload sample bams and launch pipeline
     shared_ids['sample.bam'] = job.addChildJobFn(download_url_job, url=url, name='sample.bam',
                                                  s3_key_path=input_args['ssec']).rv()
     job.addFollowOnJobFn(remove_supplementary_alignments, shared_ids, input_args)
+
 
 def remove_supplementary_alignments(job, shared_ids, input_args):
     work_dir = job.fileStore.getLocalTempDir()
@@ -355,7 +364,7 @@ def mark_dups_sample(job, shared_ids, input_args):
     # picard writes the index for file.bam at file.bai, not file.bam.bai
     _move_bai(outpath)
     shared_ids['sample.mkdups.bam.bai'] = job.fileStore.writeGlobalFile(outpath + ".bai")
-    job.addChildJobFn(realigner_target_creator, shared_ids, input_args, cores = multiprocess.cpu_count())
+    job.addChildJobFn(realigner_target_creator, shared_ids, input_args, cores = multiprocessing.cpu_count())
 
 
 def realigner_target_creator(job, shared_ids, input_args):
@@ -368,7 +377,8 @@ def realigner_target_creator(job, shared_ids, input_args):
     work_dir = job.fileStore.getLocalTempDir()
     cores = multiprocessing.cpu_count()
     # Retrieve input file paths
-    inputs = ['ref.fa','ref.fa.fai', 'ref.dict', 'phase.vcf', 'mills.vcf','sample.mkdups.bam', 'sample.mkdups.bam.bai']
+    inputs = ['ref.fa','ref.fa.fai', 'ref.dict', 'phase.vcf', 'mills.vcf','sample.mkdups.bam', 
+	      'sample.mkdups.bam.bai']
     get_files_from_filestore(job, work_dir, shared_ids, *inputs)
     # Output file path
     output = os.path.join(work_dir, 'sample.intervals')
@@ -430,7 +440,7 @@ def indel_realignment(job, shared_ids, input_args):
     shared_ids['sample.indel.bam'] = job.fileStore.writeGlobalFile(outpath)
     _move_bai(outpath)
     shared_ids['sample.indel.bam.bai'] = job.fileStore.writeGlobalFile(outpath + ".bai")
-    job.addChildJobFn(base_recalibration, shared_ids, input_args, cores = multiprocess.cpu_count())
+    job.addChildJobFn(base_recalibration, shared_ids, input_args, cores = multiprocessing.cpu_count())
 
 
 def base_recalibration(job, shared_ids, input_args):
@@ -514,7 +524,8 @@ def main():
     Job.Runner.addToilOptions(argparser)
     pargs = argparser.parse_args()
     # Variables to pass to initial job
-    inputs = {'ref.fa': pargs.reference,
+    memory_on_leader = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') // (1024 ** 3)
+    inputs = {'ref.fa': pargs.genome,
               'config': pargs.config,
               'phase.vcf': pargs.phase,
               'mills.vcf': pargs.mills,
@@ -523,7 +534,7 @@ def main():
               's3_dir': pargs.s3_dir,
               'ssec': pargs.ssec,
               'suffix': pargs.suffix,
-              'memory': '15'}
+              'memory': str(memory_on_leader - 5)}
 
     # Launch Pipeline
     Job.Runner.startToil(Job.wrapJobFn(download_gatk_files, inputs), pargs)

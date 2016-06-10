@@ -1,1 +1,1 @@
-test_uuid,https://s3-us-west-2.amazonaws.com/bd2k-test-data/pair0.normal.bam
+NA12878,ftp://ftp-trace.ncbi.nlm.nih.gov/giab/ftp/data/NA12878/Garvan_NA12878_HG001_HiSeq_Exome/project.NIST_NIST7035_H7AP8ADXX_TAAGGCGA_1_NA12878.bwa.markDuplicates.bam
