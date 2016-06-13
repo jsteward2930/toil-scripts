@@ -38,18 +38,21 @@ def tarball_files(tar_name, file_paths, output_dir='.', prefix=''):
             f_out.add(file_path, arcname=arcname)
 
 
-def move_files(file_paths, output_dir):
+def copy_files_to(file_paths, output_dir):
     """
     Moves files from the working directory to the output directory.
 
     :param str output_dir: Output directory
     :param list[str] file_paths: Absolute file paths to move
     """
+    if not hasattr(file_paths, '__next__'):
+        file_paths = (file_paths)
+
     for file_path in file_paths:
         if not file_path.startswith('/'):
             raise ValueError('Path provided is relative not absolute.')
         dest = os.path.join(output_dir, os.path.basename(file_path))
-        shutil.move(file_path, dest)
+        shutil.copy(file_path, dest)
 
 
 def consolidate_tarballs_job(job, fname_to_id):
