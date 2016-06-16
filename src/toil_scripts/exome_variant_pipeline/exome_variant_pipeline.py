@@ -533,9 +533,9 @@ def consolidate_output(job, config, mutect, pindel, muse):
         job.fileStore.logToMaster('Moving {} to output dir: {}'.format(config.uuid, config.output_dir))
         mkdir_p(config.output_dir)
         move_files(file_paths=[out_tar], output_dir=config.output_dir)
-    if config.s3_dir:
-        job.fileStore.logToMaster('Uploading {} to S3: {}'.format(config.uuid, config.s3_dir))
-        s3am_upload(fpath=out_tar, s3_dir=config.s3_dir, num_cores=config.cores)
+    if config.s3_output_dir:
+        job.fileStore.logToMaster('Uploading {} to S3: {}'.format(config.uuid, config.s3_output_dir))
+        s3am_upload(fpath=out_tar, s3_dir=config.s3_output_dir, num_cores=config.cores)
 
 
 def upload_output_to_s3(job, input_args, output_tar):
@@ -646,7 +646,7 @@ def generate_config():
     output-dir:
 
     # Optional: Provide an s3 path (s3://bucket/dir) where results will appear
-    s3-dir:
+    s3-output-dir:
 
     # Optional: Provide a full path to a 32-byte key used for SSE-C Encryption in Amazon
     ssec:
@@ -800,6 +800,8 @@ def main():
         if config.run_muse:
             require(config.reference and config.dbsnp,
                     'Missing inputs for MuSe, check config file.')
+        require(config.output_dir or config.s3_output_dir, 'output-dir AND/OR s3-output-dir need to be defined, '
+                                                           'otherwise sample output is not stored anywhere!')
         # Program checks
         for program in ['curl', 'docker']:
             require(next(which(program), None), program + ' must be installed on every node.'.format(program))
