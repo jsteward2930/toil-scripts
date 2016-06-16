@@ -19,8 +19,6 @@ def test_exome(tmpdir):
                         '--config', os.path.join(work_dir, 'toil-exome.config'),
                         os.path.join(subdir, 'jstore'),
                         '--workDir', os.path.join(subdir, 'workDir')]
-        # Run with --samples
-        # subprocess.check_call(base_command + ['--samples', sample])
         # Run with manifest
         subprocess.check_call(base_command + ['--manifest', os.path.join(work_dir, 'toil-exome-manifest.tsv')])
     finally:
