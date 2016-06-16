@@ -93,7 +93,7 @@ def get_files_from_filestore(job, work_dir, inputD):
     return inputD
 
 
-def create_reference_index(job, genome_id):
+def create_reference_index(job, genome_id, mock=None):
     """
     Uses Samtools to create reference index file (.fasta.fai)
 
@@ -102,20 +102,22 @@ def create_reference_index(job, genome_id):
     work_dir = job.fileStore.getLocalTempDir()
 
     inputs = {'genome.fa': genome_id}
+    get_files_from_filestore(job, work_dir, inputs)
 
     # Call: Samtools
     command = ['faidx', 'genome.fa']
     docker_call(work_dir=work_dir, parameters=command,
                 tool='quay.io/ucsc_cgl/samtools:0.1.19--dd5ac549b95eb3e5d166a5e310417ef13651994e',
                 inputs=['genome.fa'],
-                outputs={'genome.fa.fai': None})
-    output = os.path.join(work_dir, 'ref.fa.fai')
+                outputs={'genome.fa.fai': None},
+                mock=mock)
+    output = os.path.join(work_dir, 'genome.fa.fai')
     assert os.path.exists(output)
     # Write to fileStore
     return job.fileStore.writeGlobalFile(output)
 
 
-def create_reference_dict(job, ref_id, input_args):
+def create_reference_dict(job, fileStoreID, memory=8, mock=None):
     """
     Uses Picardtools to create reference dictionary (.dict) for the sample
 
@@ -123,18 +125,19 @@ def create_reference_dict(job, ref_id, input_args):
     input_args: dict        Dictionary of input arguments (from main())
     """
     work_dir = job.fileStore.getLocalTempDir()
-    # Retrieve file path
-    ref_path = job.fileStore.readGlobalFile(ref_id, os.path.join(work_dir, 'ref.fa'))
+    # Retrieve file
+    inputs = {'genome.fa': fileStoreID}
+    get_files_from_filestore(job, work_dir, inputs)
     # Call: picardtools
-    command = ['CreateSequenceDictionary', 'R=ref.fa', 'O=ref.dict']
+    command = ['CreateSequenceDictionary', 'R=genome.fa', 'O=genome.dict']
     docker_call(work_dir=work_dir, parameters=command,
-                env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']},
+                env={'JAVA_OPTS':'-Xmx%sg' % memory},
                 tool='quay.io/ucsc_cgl/picardtools:1.95--dd5ac549b95eb3e5d166a5e310417ef13651994e',
-                inputs=['ref.fa'],
-                outputs={'ref.dict': None})
+                inputs=['genome.fa'],
+                outputs={'genome.dict': None},
+                mock=mock)
     # Write to fileStore
-    return job.fileStore.writeGlobalFile(os.path.join(work_dir, 'ref.dict'))
-
+    return job.fileStore.writeGlobalFile(os.path.join(work_dir, 'genome.dict'))
 
 def download_gatk_files(job, config):
     """
@@ -157,66 +160,17 @@ def save_file(job, fileStoreID, fname, input_args):
     upload_or_move(job, work_dir, input_args, fname)
 
 
-def reference_preprocessing(job, shared_ids, input_args):
+def reference_preprocessing(job, shared_ids):
     """
     Create index and dict file for reference
 
     input_args: dict        Dictionary of input argumnets
     shared_ids: dict        Dictionary of fileStore IDs
     """
-    ref_id = shared_ids['ref.fa']
-    if isinstance(ref_id, dict):
-        sys.stderr.write("shared_ids['ref.fa'] is a dict. %s['ref_id'] = %s." % (shared_ids, ref_id))
-        ref_id = ref_id['ref.fa']
-
-    shared_ids['ref.fa.fai'] = job.addChildJobFn(create_reference_index, ref_id).rv()
-    shared_ids['ref.dict'] = job.addChildJobFn(create_reference_dict, ref_id, input_args).rv()
-    job.addFollowOnJobFn(spawn_batch_preprocessing, shared_ids, input_args)
-
-
-def spawn_batch_preprocessing(job, shared_ids, input_args):
-    """
-    Spawn pipeline for each sample in the configuration file
-
-    input_args: dict        Dictionary of input argumnets
-    shared_ids: dict        Dictionary of fileStore IDs
-    """
-    samples = []
-    config = input_args['config']
-
-    # does the config file exist locally? if not, try to read from job store
-    if not os.path.exists(config):
-
-        work_dir = job.fileStore.getLocalTempDir()
-        config_path = os.path.join(work_dir, 'config.txt')
-        job.fileStore.readGlobalFile(config, config_path)
-        config = config_path
-
-    with open(config, 'r') as f:
-        for line in f.readlines():
-            if not line.isspace():
-                samples.append(line.strip().split(','))
-    for sample in samples:
-        job.addChildJobFn(download_sample, shared_ids, input_args, sample)
-
-
-def download_sample(job, shared_ids, input_args, sample):
-    """
-    Defines sample variables then downloads the sample.
-
-    ids: dict           Dictionary of fileStore IDs
-    input_args: dict    Dictionary of input arguments
-    sample: str         Contains uuid, normal url, and tumor url
-    """
-    uuid, url = sample
-    # Create a unique
-    input_args['uuid'] = uuid
-    if input_args['output_dir']:
-        input_args['output_dir'] = os.path.join(input_args['output_dir'], uuid)
-    # Downoload sample bams and launch pipeline
-    shared_ids['sample.bam'] = job.addChildJobFn(download_url_job, url=url, name='sample.bam',
-                                                 s3_key_path=input_args['ssec']).rv()
-    job.addFollowOnJobFn(remove_supplementary_alignments, shared_ids, input_args)
+    fileStoreID = shared_ids['genome.fa']
+    shared_ids['ref.fa.fai'] = job.addChildJobFn(create_reference_index, fileStoreID, mock=True).rv()
+    shared_ids['ref.dict'] = job.addChildJobFn(create_reference_dict, fileStoreID, mock=True).rv()
+    return shared_ids
 
 
 def remove_supplementary_alignments(job, shared_ids, input_args):
@@ -235,7 +189,7 @@ def remove_supplementary_alignments(job, shared_ids, input_args):
                 tool='quay.io/ucsc_cgl/samtools:1.3--256539928ea162949d8a65ca5c79a72ef557ce7c',
                 inputs=['sample.bam'],
                 outputs={'sample.nosuppl.bam': None})
-    shared_ids['sample.nosuppl.bam'] = job.fileStore.writeGlobalFile(outpath)
+    return job.fileStore.writeGlobalFile(outpath)
     job.addChildJobFn(sort_sample, shared_ids, input_args)
 
 
@@ -528,8 +482,11 @@ def parse_manifest(path_to_manifest):
                 samples.append(sample)
     return samples
 
-def gatk_preprocessing_pipeline(job, uuid, url, shared_files):
-    pass
+def gatk_preprocessing_pipeline(job, uuid, url, parameters):
+    parameters = parameters.deepcopy()
+    parameters['uuid'] = uuid
+    download = job.wrapJobFn(download_url_job, url, name='sample.bam', s3_key_path=parameters['ssec'])
+    rm_secondary = job.wrapJobFn(remove_supplementary_alignments, download.rv())
 
 
 def main():
@@ -575,9 +532,8 @@ def main():
     if args.command == 'run':
         parsed_config = {x.replace('-', '_'): y for x, y in yaml.load(open(args.config).read()).iteritems()}
         config = argparse.Namespace(**parsed_config)
-        print repr(config)
 
-        require(config.genome and config.phase and config.mills and config.dbsnp,
+        require(config.genome and config.mills and config.dbsnp and config.phase,
                 'Missing inputs for preprocessing, check config file')
 
         # Program checks
@@ -591,8 +547,12 @@ def main():
             samples = parse_manifest(args.manifest)
 
         root = Job.wrapJobFn(download_gatk_files, config)
+        ref_proc = Job.wrapJobFn(reference_preprocessing, root.rv())
+
+        root.addFollowOn(ref_proc)
+
         for uuid, url in samples:
-            root.addChildJobFn(gatk_preprocessing_pipeline, uuid, url, root.rv())
+            ref_proc.addFollowOnJobFn(gatk_preprocessing_pipeline, uuid, url, ref_proc.rv())
 
         Job.Runner.startToil(root, args)
 
