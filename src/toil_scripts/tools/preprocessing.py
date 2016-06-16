@@ -4,7 +4,7 @@ from toil_scripts.lib import require
 from toil_scripts.lib.programs import docker_call
 
 
-def cutadapt(job, r1_id, r2_id, fwd_3pr_adapter, rev_3pr_adapter):
+def run_cutadapt(job, r1_id, r2_id, fwd_3pr_adapter, rev_3pr_adapter):
     """
     Adapter triming for RNA-seq data
 
