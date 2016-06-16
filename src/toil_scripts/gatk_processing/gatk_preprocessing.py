@@ -28,11 +28,13 @@ import logging
 import textwrap
 import yaml
 
+from urlparse import urlparse
+
 from toil.job import Job
 from toil_scripts.lib import require
 from toil_scripts.lib.files import mkdir_p
 from toil_scripts.lib.urls import download_url_job, s3am_upload
-from toil_scripts.lib.programs import docker_call
+from toil_scripts.lib.programs import which, docker_call
 
 from toil_scripts.tools.preprocessing import cutadapt
 
@@ -56,30 +58,24 @@ def copy_to(work_dir, output_dir, *filenames):
         except IOError:
             mkdir_p(output_dir)
             shutil.copy(origin, dest)
-    f = open('copy_log', 'a')
-    f.write('Copied: {}\nDest: {}\n'.format(origin, dest))
-    f.close()
 
 
-def upload_or_move(job, work_dir, input_args, output):
-
-    # are we moving this into a local dir, or up to s3?
-    if input_args['output_dir']:
+def upload_or_move(job, filename, work_dir, output_dir=None, s3_dir=None, s3_key_path=None):
+    if output_dir:
         # get output path and
-        output_dir = input_args['output_dir']
         mkdir_p(output_dir)
-        copy_to(work_dir, output_dir, output)
+        copy_to(work_dir, output_dir, filename)
 
-    elif input_args['s3_dir']:
-        s3am_upload(fpath=os.path.join(work_dir, output),
-                    s3_dir=input_args['s3_dir'],
-                    s3_key_path=input_args['ssec'])
+    elif s3_dir:
+        s3am_upload(fpath=os.path.join(work_dir, filename),
+                    s3_dir=s3_dir,
+                    s3_key_path=s3_key_path)
 
     else:
-        raise ValueError('No output_directory or s3_dir defined. Cannot determine where to store %s' % output)
+        raise ValueError('No output_directory or s3_dir defined. Cannot determine where to store %s' % filename)
 
 
-def get_files_from_filestore(job, work_dir, ids, *args):
+def get_files_from_filestore(job, work_dir, inputD):
     """
     Given one or more strings representing file_names, return the paths to those files. Each item must be unpacked!
 
@@ -88,50 +84,31 @@ def get_files_from_filestore(job, work_dir, ids, *args):
     *args: str(s)       for every file in *args, place file in work_dir via FileStore
     """
     paths = collections.OrderedDict()
-    for name in args:
+    for name, fileStoreID in inputD.iteritems():
         if not os.path.exists(os.path.join(work_dir, name)):
-            file_path = job.fileStore.readGlobalFile(ids[name], os.path.join(work_dir, name))
+            file_path = job.fileStore.readGlobalFile(fileStoreID, os.path.join(work_dir, name))
         else:
             file_path = name
-        paths[name] = file_path
-        if len(args) == 1:
-            paths = file_path
-    return paths
+        inputD[name] = file_path
+    return inputD
 
 
-def docker_path(file_path):
-    """
-    Returns the path internal to the docker container (for standard reasons, this is always /data)
-    """
-    return os.path.join('/data', os.path.basename(file_path))
-
-
-def create_reference_index(job, ref_id):
+def create_reference_index(job, genome_id):
     """
     Uses Samtools to create reference index file (.fasta.fai)
 
     ref_id: str     The fileStore ID of the reference
     """
     work_dir = job.fileStore.getLocalTempDir()
-    # Retrieve file path to reference
-    try:
-        job.fileStore.readGlobalFile(ref_id, os.path.join(work_dir, 'ref.fa'))  
-    except:
-        sys.stderr.write("Failed when reading global file %s to %s. Retrying with dict index." % (ref_id,
-                                                                                                  os.path.join(work_dir, 'ref.fa')))
-        
-        try:
-            job.fileStore.readGlobalFile(ref_id['ref.fa'], os.path.join(work_dir, 'ref.fa'))  
-        except:
-            sys.stderr.write("Reading %s on retry failed." % ref_id['ref.fa'])
-            raise
+
+    inputs = {'genome.fa': genome_id}
 
     # Call: Samtools
-    command = ['faidx', 'ref.fa']
+    command = ['faidx', 'genome.fa']
     docker_call(work_dir=work_dir, parameters=command,
                 tool='quay.io/ucsc_cgl/samtools:0.1.19--dd5ac549b95eb3e5d166a5e310417ef13651994e',
-                inputs=['ref.fa'],
-                outputs={'ref.fa.fai': None})
+                inputs=['genome.fa'],
+                outputs={'genome.fa.fai': None})
     output = os.path.join(work_dir, 'ref.fa.fai')
     assert os.path.exists(output)
     # Write to fileStore
@@ -159,18 +136,19 @@ def create_reference_dict(job, ref_id, input_args):
     return job.fileStore.writeGlobalFile(os.path.join(work_dir, 'ref.dict'))
 
 
-def download_gatk_files(job, input_args):
+def download_gatk_files(job, config):
     """
     Downloads files shared by all samples in the pipeline
 
     input_args: dict        Dictionary of input arguments (from main())
     """
     shared_ids = {}
-    for fname in ['ref.fa', 'phase.vcf', 'mills.vcf', 'dbsnp.vcf']:
-        shared_ids[fname] = job.addChildJobFn(download_url_job, url=input_args[fname], name=fname,
-                                              s3_key_path=input_args['ssec']).rv()
-        job.addFollowOnJobFn(save_file, shared_ids[fname], fname, input_args)
-    job.addFollowOnJobFn(reference_preprocessing, shared_ids, input_args)
+    reference_names = ['genome.fa', 'phase.vcf', 'mills.vcf', 'dbsnp.vcf']
+    reference_url = [config.genome, config.phase, config.mills, config.dbsnp]
+    for name, url in zip(reference_names, reference_url):
+        shared_ids[name] = job.addChildJobFn(download_url_job, url=url, name=name,
+                                             s3_key_path=config.ssec).rv()
+    return shared_ids
 
 def save_file(job, fileStoreID, fname, input_args): 
     work_dir = job.fileStore.getLocalTempDir()
@@ -530,6 +508,30 @@ def generate_manifest():
         #   Place your samples below, one per line.
         """[1:])
 
+def parse_manifest(path_to_manifest):
+    """
+    Parses samples, specified in either a manifest or listed with --samples
+
+    :param str path_to_manifest: Path to configuration file
+    :return: Samples and their attributes as defined in the manifest
+    :rtype: list[list]
+    """
+    samples = []
+    with open(path_to_manifest, 'r') as f:
+        for line in f.readlines():
+            if not line.isspace() and not line.startswith('#'):
+                sample = line.strip().split('\t')
+                require(len(sample) == 2, 'Bad manifest format! '
+                                          'Expected 3 tab separated columns, got: {}'.format(sample))
+                uuid, url = sample
+                require(urlparse(url).scheme and urlparse(url), 'Invalid URL passed for {}'.format(url))
+                samples.append(sample)
+    return samples
+
+def gatk_preprocessing_pipeline(job, uuid, url, shared_files):
+    pass
+
+
 def main():
     """
     GATK Pre-processing Script
@@ -570,18 +572,29 @@ def main():
         generate_file(os.path.join(cwd, 'manifest-toil-germline.tsv'), generate_manifest)
     if 'generate' in args.command:
         sys.exit()
-
-    parsed_config = {x.replace('-', '_'): y for x, y in yaml.load(open(args.config).read()).iteritems()}
-    config = argparse.Namespace(**parsed_config)
-    print repr(config)
-
-    require(config.genome and config.phase and config.mills and config.dbsnp,
-            'Missing inputs for preprocessing, check config file')
-
-    # Launch Pipeline
     if args.command == 'run':
-        sys.exit()
-        Job.Runner.startToil(Job.wrapJobFn(download_gatk_files, inputs), args)
+        parsed_config = {x.replace('-', '_'): y for x, y in yaml.load(open(args.config).read()).iteritems()}
+        config = argparse.Namespace(**parsed_config)
+        print repr(config)
+
+        require(config.genome and config.phase and config.mills and config.dbsnp,
+                'Missing inputs for preprocessing, check config file')
+
+        # Program checks
+        for program in ['curl', 'docker']:
+            require(which(program), program + ' must be installed on every node.'.format(program))
+
+        if args.bam or args.uuid:
+            require(args.bam and args.uuid, '"--bam" and "--uuid" must all be supplied')
+            samples = [[args.uuid, args.normal, args.tumor]]
+        else:
+            samples = parse_manifest(args.manifest)
+
+        root = Job.wrapJobFn(download_gatk_files, config)
+        for uuid, url in samples:
+            root.addChildJobFn(gatk_preprocessing_pipeline, uuid, url, root.rv())
+
+        Job.Runner.startToil(root, args)
 
 if __name__ == '__main__':
     main()
