@@ -22,73 +22,25 @@ import argparse
 import collections
 import multiprocessing
 import os
-import hashlib
-import base64
-import subprocess
 import shutil
 import sys
 import logging
-import errno
-from toil.job import Job
+import textwrap
+import yaml
 
+from toil.job import Job
+from toil_scripts.lib import require
 from toil_scripts.lib.files import mkdir_p
 from toil_scripts.lib.urls import download_url_job, s3am_upload
 from toil_scripts.lib.programs import docker_call
 
+from toil_scripts.tools.preprocessing import cutadapt
+
 _log = logging.getLogger(__name__)
 
-debug = False 
-
-def build_parser():
-    """
-    Contains argparse arguments
-    """
-    parser = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('-f', '--config', required=True, help="Each line contains (CSV): UUID, BAM_URL")
-    parser.add_argument('-o', '--output_dir', required=True, help='Full path to final output dir')
-    parser.add_argument('-g', '--genome', required=True, help="Reference Genome URL")
-    parser.add_argument('-p', '--phase', required=True, help='1000G_phase1.indels.hg19.sites.fixed.vcf URL')
-    parser.add_argument('-m', '--mills', required=True, help='Mills_and_1000G_gold_standard.indels.hg19.sites.vcf URL')
-    parser.add_argument('-d', '--dbsnp', required=True, help='dbsnp_132_b37.leftAligned.vcf URL')
-    parser.add_argument('-s', '--ssec', help='A key that can be used to fetch encrypted data')
-    parser.add_argument('-3', '--s3_dir', default=None, help='S3 Directory, starting with bucket name. e.g.: '
-                                                             'cgl-driver-projects/ckcc/rna-seq-samples/')
-    parser.add_argument('-x', '--suffix', default=".bqsr", help='additional suffix, if any')
-    return parser
-
 # Convenience functions used in the pipeline
-def flatten(x):
-    """
-    Flattens a nested array into a single list
 
-    x: list/tuple       The nested list/tuple to be flattened.
-    """
-    result = []
-    for el in x:
-        if hasattr(el, "__iter__") and not isinstance(el, basestring):
-            result.extend(flatten(el))
-        else:
-            result.append(el)
-    return result
-
-
-def generate_unique_key(master_key_path, url):
-    """
-    master_key_path: str    Path to the BD2K Master Key (for S3 Encryption)
-    url: str                S3 URL (e.g. https://s3-us-west-2.amazonaws.com/bucket/file.txt)
-
-    Returns: str            32-byte unique key generated for that URL
-    """
-    with open(master_key_path, 'r') as f:
-        master_key = f.read()
-    assert len(master_key) == 32, 'Invalid Key! Must be 32 characters. ' \
-                                  'Key: {}, Length: {}'.format(master_key, len(master_key))
-    new_key = hashlib.sha256(master_key + url).digest()
-    assert len(new_key) == 32, 'New key is invalid and is not 32 characters: {}'.format(new_key)
-    return new_key
-
-
-def copy_to_output_dir(work_dir, output_dir, *filenames):
+def copy_to(work_dir, output_dir, *filenames):
     """
     Moves files from the working directory to the output directory.
 
@@ -116,7 +68,7 @@ def upload_or_move(job, work_dir, input_args, output):
         # get output path and
         output_dir = input_args['output_dir']
         mkdir_p(output_dir)
-        copy_to_output_dir(work_dir, output_dir, output)
+        copy_to(work_dir, output_dir, output)
 
     elif input_args['s3_dir']:
         s3am_upload(fpath=os.path.join(work_dir, output),
@@ -515,29 +467,121 @@ def print_reads(job, shared_ids, input_args):
     _move_bai(outpath)
     upload_or_move(job, work_dir, input_args, outfile_idx)
 
+def generate_file(file_path, generate_func):
+    require(not os.path.exists(file_path), file_path + ' already exists!')
+    with open(file_path, 'w') as f:
+        f.write(generate_func())
+    print('\t{} has been generated in the current working directory.'.format(os.path.basename(file_path)))
+
+def generate_config():
+    return textwrap.dedent("""
+    # CGL Germline Variant Pipeline configuration file
+    # This configuration file is formatted in YAML. Simply write the value (at least one space) after the colon.
+    # Edit the values in this configuration file and then rerun the pipeline: "toil-variant run"
+    # URLs can take the form: http://, file://, s3://, gnos://.
+    # Comments (beginning with #) do not need to be removed. Optional parameters may be left blank
+    ####################################################################################################################
+    # Required: URL to reference genome
+    genome: s3://cgl-pipeline-inputs/variant_hg19/hg19.fa
+
+    # Required: URL to phase indels VCF
+    phase: s3://cgl-pipeline-inputs/variant_hg19/1000G_phase1.indels.hg19.sites.vcf
+
+    # Required: URL to Mills indel VCF
+    mills: s3://cgl-pipeline-inputs/variant_hg19/Mills_and_1000G_gold_standard.indels.hg19.sites.vcf
+
+    # Required: URL to dbsnp VCF
+    dbsnp: s3://cgl-pipeline-inputs/variant_hg19/dbsnp_138.hg19.vcf
+
+    # Required: URL to cosmic VCF
+    cosmic: s3://cgl-pipeline-inputs/variant_hg19/cosmic.hg19.vcf
+
+    # Optional: Provide a full path to where results will appear
+    output-dir:
+
+    # Optional: Provide an s3 path (s3://bucket/dir) where results will appear
+    s3-dir:
+
+    # Optional: Provide a full path to a 32-byte key used for SSE-C Encryption in Amazon
+    ssec:
+
+    # Optional: Provide a full path to a CGHub Key used to access GNOS hosted data
+    gtkey:
+
+    # Optional: Provide a suffix for naming output files
+    suffix:
+    """[1:])
+
+
+def generate_manifest():
+    return textwrap.dedent("""
+        #   Edit this manifest to include information pertaining to each sample pair to be run.
+        #   There are 2tab-separated columns: UUID, Sample BAM URL
+        #
+        #   UUID            This should be a unique identifier for the sample to be processed
+        #   Sample URL      A URL (http://, file://, s3://, gnos://) pointing to the normal bam
+        #
+        #   Examples of several combinations are provided below. Lines beginning with # are ignored.
+        #
+        #   UUID_1  file:///path/to/sample.bam
+        #   UUID_2  http://sample-depot.com/sample.bam
+        #   UUID_3  s3://my-bucket-name/directory/sample.bam
+        #
+        #   Place your samples below, one per line.
+        """[1:])
+
 def main():
     """
     GATK Pre-processing Script
     """
-    # Define Parser object and add to jobTree
-    argparser = build_parser()
-    Job.Runner.addToilOptions(argparser)
-    pargs = argparser.parse_args()
-    # Variables to pass to initial job
-    memory_on_leader = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') // (1024 ** 3)
-    inputs = {'ref.fa': pargs.genome,
-              'config': pargs.config,
-              'phase.vcf': pargs.phase,
-              'mills.vcf': pargs.mills,
-              'dbsnp.vcf': pargs.dbsnp,
-              'output_dir': pargs.output_dir,
-              's3_dir': pargs.s3_dir,
-              'ssec': pargs.ssec,
-              'suffix': pargs.suffix,
-              'memory': str(memory_on_leader - 5)}
+    parser = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    subparsers = parser.add_subparsers(dest='command')
+    subparsers.add_parser('generate-config', help='Generates an editable config in the current working directory.')
+    subparsers.add_parser('generate-manifest', help='Generates an editable manifest in the current working directory.')
+    subparsers.add_parser('generate', help='Generates a config and manifest in the current working directory.')
+
+
+    # Run subparser
+    parser_run = subparsers.add_parser('run', help='Runs the CGL germline pipeline')
+    parser_run.add_argument('--config', default='config-toil-germline.yaml', type=str,
+                            help='Path to the (filled in) config file, generated with "generate-config". '
+                                 '\nDefault value: "%(default)s"')
+    parser_run.add_argument('--manifest', default='manifest-toil-germline.tsv', type=str,
+                            help='Path to the (filled in) manifest file, generated with "generate-manifest". '
+                                 '\nDefault value: "%(default)s"')
+    parser_run.add_argument('--bam', default=None, type=str,
+                            help='URL for the sample BAM. URLs can take the form: http://, file://, s3://, '
+                                 'and gnos://. The UUID for the sample must be given with the "--uuid" flag.')
+    parser_run.add_argument('--uuid', default=None, type=str, help='Provide the UUID of a sample when using the'
+                                                                   '"--bam" option')
+
+    # If no arguments provided, print full help menu
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(1)
+
+    Job.Runner.addToilOptions(parser)
+    args = parser.parse_args()
+
+    cwd = os.getcwd()
+    if args.command == 'generate-config' or args.command == 'generate':
+        generate_file(os.path.join(cwd, 'config-toil-germline.yaml'), generate_config)
+    if args.command == 'generate-manifest' or args.command == 'generate':
+        generate_file(os.path.join(cwd, 'manifest-toil-germline.tsv'), generate_manifest)
+    if 'generate' in args.command:
+        sys.exit()
+
+    parsed_config = {x.replace('-', '_'): y for x, y in yaml.load(open(args.config).read()).iteritems()}
+    config = argparse.Namespace(**parsed_config)
+    print repr(config)
+
+    require(config.genome and config.phase and config.mills and config.dbsnp,
+            'Missing inputs for preprocessing, check config file')
 
     # Launch Pipeline
-    Job.Runner.startToil(Job.wrapJobFn(download_gatk_files, inputs), pargs)
+    if args.command == 'run':
+        sys.exit()
+        Job.Runner.startToil(Job.wrapJobFn(download_gatk_files, inputs), args)
 
 if __name__ == '__main__':
     main()
