@@ -52,6 +52,26 @@ def move_files(file_paths, output_dir):
         shutil.move(file_path, dest)
 
 
+def copy_to(filename, output_dir, work_dir=None):
+    """
+    Moves files from the working directory to the output directory.
+
+    :param work_dir: the working directory
+    :param output_dir: the output directory
+    :param filenames: remaining arguments are filenames
+    """
+    if work_dir is None:
+        origin = os.path.abspath(filename)
+    else:
+        origin = os.path.join(work_dir, filename)
+    dest = os.path.join(output_dir, filename)
+    try:
+        shutil.copytree(origin, dest)
+    except OSError as e:
+        if e.errno == errno.ENOTDIR:
+            mkdir_p(output_dir)
+            shutil.copy(origin, dest)
+
 def consolidate_tarballs_job(job, fname_to_id):
     """
     Combine the contents of separate tarballs into one.

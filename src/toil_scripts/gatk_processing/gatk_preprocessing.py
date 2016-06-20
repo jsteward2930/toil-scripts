@@ -16,13 +16,12 @@ Toil pipeline for processing bam files for GATK halpotype calling
 9 = indel realignment
 10 = index
 11 = base recalibration
-12 = ouput bqsr file
+12 = output bqsr file
 """
 import argparse
 import collections
 import multiprocessing
 import os
-import shutil
 import sys
 import logging
 import textwrap
@@ -32,7 +31,7 @@ from urlparse import urlparse
 
 from toil.job import Job
 from toil_scripts.lib import require
-from toil_scripts.lib.files import mkdir_p
+from toil_scripts.lib.files import mkdir_p, copy_to
 from toil_scripts.lib.urls import download_url_job, s3am_upload
 from toil_scripts.lib.programs import which, docker_call
 
@@ -41,23 +40,6 @@ from toil_scripts.tools.preprocessing import cutadapt
 _log = logging.getLogger(__name__)
 
 # Convenience functions used in the pipeline
-
-def copy_to(work_dir, output_dir, *filenames):
-    """
-    Moves files from the working directory to the output directory.
-
-    :param work_dir: the working directory
-    :param output_dir: the output directory
-    :param filenames: remaining arguments are filenames
-    """
-    for filename in filenames:
-        origin = os.path.join(work_dir, filename)
-        dest = os.path.join(output_dir, filename)
-        try:
-            shutil.copy(origin, dest)
-        except IOError:
-            mkdir_p(output_dir)
-            shutil.copy(origin, dest)
 
 
 def upload_or_move(job, filename, work_dir, output_dir=None, s3_dir=None, s3_key_path=None):
