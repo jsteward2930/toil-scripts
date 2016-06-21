@@ -99,7 +99,7 @@ def samtools_faidx(job, fileStoreID, mock=False):
     return job.fileStore.writeGlobalFile(output)
 
 
-def picard_CreateSequenceDictionary(job, fileStoreID, memory=8, mock=False):
+def picard_create_sequence_dictionary(job, fileStoreID, memory=8, mock=False):
     """
     Uses Picardtools to create reference dictionary (.dict) for the sample
 
@@ -153,7 +153,7 @@ def reference_preprocessing(job, config, mock=False):
     if 'genome.fa.fai' not in config:
         config['genome.fa.fai'] = job.addChildJobFn(samtools_faidx, fileStoreID, mock=mock).rv()
     if 'genome.dict' not in config:
-        config['genome.dict'] = job.addChildJobFn(picard_CreateSequenceDictionary, fileStoreID, mock=mock).rv()
+        config['genome.dict'] = job.addChildJobFn(picard_create_sequence_dictionary, fileStoreID, mock=mock).rv()
     return config
 
 
@@ -185,7 +185,7 @@ def _move_bai(outpath):
     return newname
 
 
-def picard_SortSam(job, fileStoreID, config):
+def picard_sort_sam(job, fileStoreID, config):
     """
     Uses picardtools SortSam to sort a sample bam file
 
@@ -214,7 +214,7 @@ def picard_SortSam(job, fileStoreID, config):
     return bam_id, bai_id
 
 
-def picard_MarkDuplicates(job, bamFileStoreID, baiFileStoreID, config):
+def picard_mark_duplicates(job, bamFileStoreID, baiFileStoreID, config):
     """
     Uses picardtools MarkDuplicates
     """
@@ -248,7 +248,7 @@ def picard_MarkDuplicates(job, bamFileStoreID, baiFileStoreID, config):
     # job.addChildJobFn(realigner_target_creator, shared_ids, input_args, cores = multiprocessing.cpu_count())
 
 
-def gatk_RealignerTargetCreator(job, bamFileStoreID, baiFileStoreID, config):
+def gatk_realigner_target_creator(job, bamFileStoreID, baiFileStoreID, config):
     """
     Creates <type>.intervals file needed for indel realignment
 
@@ -286,7 +286,7 @@ def gatk_RealignerTargetCreator(job, bamFileStoreID, baiFileStoreID, config):
     # job.addChildJobFn(indel_realignment, shared_ids, input_args)
 
 
-def gatk_IndelRealigner(job, bamFileStoreID, baiFileStoreID, intervalsFileStoreID, config):
+def gatk_indel_realigner(job, bamFileStoreID, baiFileStoreID, intervalsFileStoreID, config):
     """
     Creates realigned bams using <sample>.intervals file from previous step
 
@@ -331,7 +331,7 @@ def gatk_IndelRealigner(job, bamFileStoreID, baiFileStoreID, intervalsFileStoreI
     # job.addChildJobFn(base_recalibration, shared_ids, input_args, cores = multiprocessing.cpu_count())
 
 
-def gatk_BaseRecalibrator(job, bamFileStoreID, baiFileStoreID, config):
+def gatk_base_recalibrator(job, bamFileStoreID, baiFileStoreID, config):
     """
     Creates recal table to perform Base Quality Score Recalibration
 
@@ -371,7 +371,7 @@ def gatk_BaseRecalibrator(job, bamFileStoreID, baiFileStoreID, config):
     # job.addChildJobFn(print_reads, shared_ids, input_args, cores = cores)
 
 
-def gatk_PrintReads(job, bamFileStoreID, baiFileStoreID, recalFileStoreID, config):
+def gatk_print_reads(job, bamFileStoreID, baiFileStoreID, recalFileStoreID, config):
     """
     Create bam that has undergone Base Quality Score Recalibration (BQSR)
 
@@ -505,14 +505,15 @@ def parse_manifest(path_to_manifest):
 def gatk_preprocessing_pipeline(job, uuid, url, config):
     config = deepcopy(config)
     config['uuid'] = uuid
-    download = job.wrapJobFn(download_url_job, url, name='sample.bam', s3_key_path=config['ssec'])
+    sampe_name = os.path.basename(url)
+    download = job.wrapJobFn(download_url_job, url, name=sampe_name, s3_key_path=config['ssec'])
     rm_secondary = job.wrapJobFn(remove_supplementary_alignments, download.rv(), mock=config['mock'])
-    picard_sort = job.wrapJobFn(picard_SortSam, rm_secondary.rv(), config)
-    mdups = job.wrapJobFn(picard_MarkDuplicates, picard_sort.rv(0), picard_sort.rv(1), config)
-    target = job.wrapJobFn(gatk_RealignerTargetCreator, mdups.rv(0), mdups.rv(1), config)
-    indel = job.wrapJobFn(gatk_IndelRealigner, mdups.rv(0), mdups.rv(1), target.rv(), config)
-    base = job.wrapJobFn(gatk_BaseRecalibrator, indel.rv(0), indel.rv(1), config)
-    print_reads = job.wrapJobFn(gatk_PrintReads, indel.rv(0), indel.rv(1), base.rv(), config)
+    picard_sort = job.wrapJobFn(picard_sort_sam, rm_secondary.rv(), config)
+    mdups = job.wrapJobFn(picard_mark_duplicates, picard_sort.rv(0), picard_sort.rv(1), config)
+    target = job.wrapJobFn(gatk_realigner_target_creator, mdups.rv(0), mdups.rv(1), config)
+    indel = job.wrapJobFn(gatk_indel_realigner, mdups.rv(0), mdups.rv(1), target.rv(), config)
+    base = job.wrapJobFn(gatk_base_recalibrator, indel.rv(0), indel.rv(1), config)
+    print_reads = job.wrapJobFn(gatk_print_reads, indel.rv(0), indel.rv(1), base.rv(), config)
 
 
     job.addChild(download)
