@@ -20,7 +20,7 @@ dbsnp: file:///home/jacob/code/toil-scripts/src/toil_scripts/gatk_processing/dum
 cosmic: file:///home/jacob/code/toil-scripts/src/toil_scripts/gatk_processing/dummy.file
 
 # Optional: Provide a full path to where results will appear
-output-dir:
+output-dir: /home/jacob/test
 
 # Optional: Provide an s3 path (s3://bucket/dir) where results will appear
 s3-dir:
@@ -36,3 +36,5 @@ suffix:
 
 # Optional: Provide boolean value to run pipeline in mock mode
 mock: True
+
+memory: 15

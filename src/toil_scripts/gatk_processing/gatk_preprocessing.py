@@ -7,16 +7,17 @@ Toil pipeline for processing bam files for GATK halpotype calling
 
 1 = download shared data
 2 = reference preprocessing
-3 = download sample 
-4 = index
-5 = sort
-6 = mark duplicates
-7 = index
-8 = realigner target 
-9 = indel realignment
-10 = index
-11 = base recalibration
-12 = output bqsr file
+3 = download sample
+4 = remove secondary alignments
+5 = index sample
+6 = sort sample
+7 = mark duplicates
+8 = index
+9 = realigner target
+10 = indel realignment
+11 = index
+12 = base recalibration
+13 = output bqsr fil6
 """
 import argparse
 import collections
@@ -27,26 +28,25 @@ import logging
 import textwrap
 import yaml
 
+from copy import deepcopy
 from urlparse import urlparse
 
 from toil.job import Job
 from toil_scripts.lib import require
-from toil_scripts.lib.files import mkdir_p, copy_to
+from toil_scripts.lib.files import copy_to
 from toil_scripts.lib.urls import download_url_job, s3am_upload
-from toil_scripts.lib.programs import which, docker_call
+from toil_scripts.lib.programs import docker_call
 
-from toil_scripts.tools.preprocessing import cutadapt
+from bd2k.util.processes import which
 
 _log = logging.getLogger(__name__)
 
 # Convenience functions used in the pipeline
 
 
-def upload_or_move(job, filename, work_dir, output_dir=None, s3_dir=None, s3_key_path=None):
+def upload_or_move(filename, work_dir=None, output_dir=None, s3_dir=None, s3_key_path=None):
     if output_dir:
-        # get output path and
-        mkdir_p(output_dir)
-        copy_to(work_dir, output_dir, filename)
+        copy_to(filename, output_dir, work_dir)
 
     elif s3_dir:
         s3am_upload(fpath=os.path.join(work_dir, filename),
@@ -57,7 +57,7 @@ def upload_or_move(job, filename, work_dir, output_dir=None, s3_dir=None, s3_key
         raise ValueError('No output_directory or s3_dir defined. Cannot determine where to store %s' % filename)
 
 
-def get_files_from_filestore(job, work_dir, inputD):
+def get_files_from_filestore(job, workDir, inputDict):
     """
     Given one or more strings representing file_names, return the paths to those files. Each item must be unpacked!
 
@@ -66,16 +66,16 @@ def get_files_from_filestore(job, work_dir, inputD):
     *args: str(s)       for every file in *args, place file in work_dir via FileStore
     """
     paths = collections.OrderedDict()
-    for name, fileStoreID in inputD.iteritems():
-        if not os.path.exists(os.path.join(work_dir, name)):
-            file_path = job.fileStore.readGlobalFile(fileStoreID, os.path.join(work_dir, name))
+    for name, fileStoreID in inputDict.iteritems():
+        if not os.path.exists(os.path.join(workDir, name)):
+            file_path = job.fileStore.readGlobalFile(fileStoreID, os.path.join(workDir, name))
         else:
             file_path = name
-        inputD[name] = file_path
-    return inputD
+        inputDict[name] = file_path
+    return inputDict
 
 
-def create_reference_index(job, genome_id, mock=None):
+def samtools_faidx(job, fileStoreID, mock=False):
     """
     Uses Samtools to create reference index file (.fasta.fai)
 
@@ -83,14 +83,14 @@ def create_reference_index(job, genome_id, mock=None):
     """
     work_dir = job.fileStore.getLocalTempDir()
 
-    inputs = {'genome.fa': genome_id}
+    inputs = {'genome.fa': fileStoreID}
     get_files_from_filestore(job, work_dir, inputs)
 
     # Call: Samtools
     command = ['faidx', 'genome.fa']
     docker_call(work_dir=work_dir, parameters=command,
                 tool='quay.io/ucsc_cgl/samtools:0.1.19--dd5ac549b95eb3e5d166a5e310417ef13651994e',
-                inputs=['genome.fa'],
+                inputs=inputs.keys(),
                 outputs={'genome.fa.fai': None},
                 mock=mock)
     output = os.path.join(work_dir, 'genome.fa.fai')
@@ -99,7 +99,7 @@ def create_reference_index(job, genome_id, mock=None):
     return job.fileStore.writeGlobalFile(output)
 
 
-def create_reference_dict(job, fileStoreID, memory=8, mock=None):
+def picard_CreateSequenceDictionary(job, fileStoreID, memory=8, mock=False):
     """
     Uses Picardtools to create reference dictionary (.dict) for the sample
 
@@ -107,7 +107,6 @@ def create_reference_dict(job, fileStoreID, memory=8, mock=None):
     input_args: dict        Dictionary of input arguments (from main())
     """
     work_dir = job.fileStore.getLocalTempDir()
-    # Retrieve file
     inputs = {'genome.fa': fileStoreID}
     get_files_from_filestore(job, work_dir, inputs)
     # Call: picardtools
@@ -115,11 +114,12 @@ def create_reference_dict(job, fileStoreID, memory=8, mock=None):
     docker_call(work_dir=work_dir, parameters=command,
                 env={'JAVA_OPTS':'-Xmx%sg' % memory},
                 tool='quay.io/ucsc_cgl/picardtools:1.95--dd5ac549b95eb3e5d166a5e310417ef13651994e',
-                inputs=['genome.fa'],
+                inputs=inputs.keys(),
                 outputs={'genome.dict': None},
                 mock=mock)
     # Write to fileStore
     return job.fileStore.writeGlobalFile(os.path.join(work_dir, 'genome.dict'))
+
 
 def download_gatk_files(job, config):
     """
@@ -127,39 +127,40 @@ def download_gatk_files(job, config):
 
     input_args: dict        Dictionary of input arguments (from main())
     """
-    shared_ids = {}
     reference_names = ['genome.fa', 'phase.vcf', 'mills.vcf', 'dbsnp.vcf']
-    reference_url = [config.genome, config.phase, config.mills, config.dbsnp]
-    for name, url in zip(reference_names, reference_url):
-        shared_ids[name] = job.addChildJobFn(download_url_job, url=url, name=name,
-                                             s3_key_path=config.ssec).rv()
-    return shared_ids
+    for name in reference_names:
+        key, _ = name.split('.')
+        config[name] = job.addChildJobFn(download_url_job, url=config[key], name=name,
+                                             s3_key_path=config['ssec']).rv()
+    return config
 
-def save_file(job, fileStoreID, fname, input_args): 
+
+def save_file(job, fileStoreID, fname, config):
     work_dir = job.fileStore.getLocalTempDir()
     work_path = os.path.join(work_dir, fname)
     job.fileStore.readGlobalFile(fileStoreID, work_path)
-    upload_or_move(job, work_dir, input_args, fname)
+    upload_or_move(job, work_dir, config, fname)
 
 
-def reference_preprocessing(job, shared_ids):
+def reference_preprocessing(job, config, mock=False):
     """
     Create index and dict file for reference
 
     input_args: dict        Dictionary of input argumnets
     shared_ids: dict        Dictionary of fileStore IDs
     """
-    fileStoreID = shared_ids['genome.fa']
-    shared_ids['ref.fa.fai'] = job.addChildJobFn(create_reference_index, fileStoreID, mock=True).rv()
-    shared_ids['ref.dict'] = job.addChildJobFn(create_reference_dict, fileStoreID, mock=True).rv()
-    return shared_ids
+    fileStoreID = config['genome.fa']
+    if 'genome.fa.fai' not in config:
+        config['genome.fa.fai'] = job.addChildJobFn(samtools_faidx, fileStoreID, mock=mock).rv()
+    if 'genome.dict' not in config:
+        config['genome.dict'] = job.addChildJobFn(picard_CreateSequenceDictionary, fileStoreID, mock=mock).rv()
+    return config
 
 
-def remove_supplementary_alignments(job, shared_ids, input_args):
+def remove_supplementary_alignments(job, fileStoreID, mock=False):
     work_dir = job.fileStore.getLocalTempDir()
-
-    #Retrieve file path
-    get_files_from_filestore(job, work_dir, shared_ids, 'sample.bam')
+    inputs = {'sample.bam': fileStoreID}
+    get_files_from_filestore(job, work_dir, inputs)
     outpath = os.path.join(work_dir, 'sample.nosuppl.bam')
 
     command = ['view',
@@ -169,27 +170,33 @@ def remove_supplementary_alignments(job, shared_ids, input_args):
                
     docker_call(work_dir=work_dir, parameters=command,
                 tool='quay.io/ucsc_cgl/samtools:1.3--256539928ea162949d8a65ca5c79a72ef557ce7c',
-                inputs=['sample.bam'],
-                outputs={'sample.nosuppl.bam': None})
+                inputs=inputs.keys(),
+                outputs={'sample.nosuppl.bam': None},
+                mock=mock)
     return job.fileStore.writeGlobalFile(outpath)
-    job.addChildJobFn(sort_sample, shared_ids, input_args)
 
 
 def _move_bai(outpath):
 
     # bam index gets written without bam extension
-    os.rename(outpath.replace('bam', 'bai'), outpath + '.bai')
+    name = outpath.replace('bam', 'bai')
+    newname = outpath + '.bai'
+    os.rename(name, newname)
+    return newname
 
 
-def sort_sample(job, shared_ids, input_args):
+def picard_SortSam(job, fileStoreID, config):
     """
     Uses picardtools SortSam to sort a sample bam file
+
+    Assumes machine has at least 4G of RAM
     """
     work_dir = job.fileStore.getLocalTempDir()
-
-    #Retrieve file path
-    get_files_from_filestore(job, work_dir, shared_ids, 'sample.nosuppl.bam')
+    inputs = {'sample.nosuppl.bam': fileStoreID}
+    memory = config['memory'] if 'memory' in config else '4'
+    get_files_from_filestore(job, work_dir, inputs)
     outpath = os.path.join(work_dir, 'sample.sorted.bam')
+
     #Call: picardtools
     command = ['SortSam',
                'INPUT=sample.nosuppl.bam',
@@ -197,21 +204,28 @@ def sort_sample(job, shared_ids, input_args):
                'SORT_ORDER=coordinate',
                'CREATE_INDEX=true']
     docker_call(work_dir=work_dir, parameters=command,
-                env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']},
+                env={'JAVA_OPTS':'-Xmx%sg' % memory},
                 tool='quay.io/ucsc_cgl/picardtools:1.95--dd5ac549b95eb3e5d166a5e310417ef13651994e',
-                inputs=['sample.nosuppl.bam'],
-                outputs={'sample.sorted.bam': None, 'sample.sorted.bai': None})
-    shared_ids['sample.sorted.bam'] = job.fileStore.writeGlobalFile(outpath)
-    job.addChildJobFn(mark_dups_sample, shared_ids, input_args)
+                inputs=inputs.keys(),
+                outputs={'sample.sorted.bam': None, 'sample.sorted.bai': None},
+                mock=config['mock'])
+    bam_id = job.fileStore.writeGlobalFile(outpath)
+    bai_id = job.fileStore.writeGlobalFile(_move_bai(outpath))
+    return bam_id, bai_id
 
 
-def mark_dups_sample(job, shared_ids, input_args):
+def picard_MarkDuplicates(job, bamFileStoreID, baiFileStoreID, config):
     """
     Uses picardtools MarkDuplicates
     """
     work_dir = job.fileStore.getLocalTempDir()
+    inputs = {'sample.sorted.bam': bamFileStoreID,
+              'sample.sorted.bai': baiFileStoreID}
+
+    memory = config['memory'] if config['memory'] is not None else '4'
+
     # Retrieve file path
-    get_files_from_filestore(job, work_dir, shared_ids, 'sample.sorted.bam')
+    get_files_from_filestore(job, work_dir, inputs)
     outpath = os.path.join(work_dir, 'sample.mkdups.bam')
     # Call: picardtools
     command = ['MarkDuplicates',
@@ -221,19 +235,20 @@ def mark_dups_sample(job, shared_ids, input_args):
                'ASSUME_SORTED=true',
                'CREATE_INDEX=true']
     docker_call(work_dir=work_dir, parameters=command,
-                env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']},
+                env={'JAVA_OPTS':'-Xmx%sg' % memory},
                 tool='quay.io/ucsc_cgl/picardtools:1.95--dd5ac549b95eb3e5d166a5e310417ef13651994e',
-                inputs=['sample.sorted.bam'],
+                inputs=inputs.keys(), mock=config['mock'],
                 outputs={'sample.mkdups.bam': None, 'sample.mkdups.bai': None})
-    shared_ids['sample.mkdups.bam'] = job.fileStore.writeGlobalFile(outpath)
 
     # picard writes the index for file.bam at file.bai, not file.bam.bai
     _move_bai(outpath)
-    shared_ids['sample.mkdups.bam.bai'] = job.fileStore.writeGlobalFile(outpath + ".bai")
-    job.addChildJobFn(realigner_target_creator, shared_ids, input_args, cores = multiprocessing.cpu_count())
+    bam_id = job.fileStore.writeGlobalFile(outpath)
+    bai_id = job.fileStore.writeGlobalFile(outpath + ".bai")
+    return bam_id, bai_id
+    # job.addChildJobFn(realigner_target_creator, shared_ids, input_args, cores = multiprocessing.cpu_count())
 
 
-def realigner_target_creator(job, shared_ids, input_args):
+def gatk_RealignerTargetCreator(job, bamFileStoreID, baiFileStoreID, config):
     """
     Creates <type>.intervals file needed for indel realignment
 
@@ -242,10 +257,12 @@ def realigner_target_creator(job, shared_ids, input_args):
     """
     work_dir = job.fileStore.getLocalTempDir()
     cores = multiprocessing.cpu_count()
-    # Retrieve input file paths
-    inputs = ['ref.fa','ref.fa.fai', 'ref.dict', 'phase.vcf', 'mills.vcf','sample.mkdups.bam', 
-	      'sample.mkdups.bam.bai']
-    get_files_from_filestore(job, work_dir, shared_ids, *inputs)
+    memory = config['memory'] if config['memory'] is not None else '4'
+    inputs = {'sample.sorted.bam': bamFileStoreID,
+              'sample.sorted.bai': baiFileStoreID}
+    references = {key: config[key] for key in ['genome.fa','genome.fa.fai', 'genome.dict', 'phase.vcf', 'mills.vcf']}
+    inputs.update(references)
+    get_files_from_filestore(job, work_dir, inputs)
     # Output file path
     output = os.path.join(work_dir, 'sample.intervals')
     # Call: GATK -- RealignerTargetCreator
@@ -261,14 +278,15 @@ def realigner_target_creator(job, shared_ids, input_args):
 
     docker_call(work_dir=work_dir, parameters=parameters,
                 tool='quay.io/ucsc_cgl/gatk:3.5--dba6dae49156168a909c43330350c6161dc7ecc2',
-                inputs=inputs,
+                inputs=inputs.keys(),
                 outputs={'sample.intervals': None},
-                env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']})
-    shared_ids['sample.intervals'] = job.fileStore.writeGlobalFile(output)
-    job.addChildJobFn(indel_realignment, shared_ids, input_args)
+                env={'JAVA_OPTS':'-Xmx%sg' % memory},
+                mock=config['mock'])
+    return job.fileStore.writeGlobalFile(output)
+    # job.addChildJobFn(indel_realignment, shared_ids, input_args)
 
 
-def indel_realignment(job, shared_ids, input_args):
+def gatk_IndelRealigner(job, bamFileStoreID, baiFileStoreID, intervalsFileStoreID, config):
     """
     Creates realigned bams using <sample>.intervals file from previous step
 
@@ -277,10 +295,13 @@ def indel_realignment(job, shared_ids, input_args):
     """
     # Unpack convenience variables for job
     work_dir = job.fileStore.getLocalTempDir()
+    memory = '10'
     # Retrieve input file paths
-    inputs = ['ref.fa','ref.fa.fai', 'ref.dict', 'phase.vcf', 'mills.vcf','sample.mkdups.bam', 'sample.mkdups.bam.bai',
-              'sample.intervals']
-    get_files_from_filestore(job, work_dir, shared_ids, *inputs)
+    inputs = {'sample.mkdups.bam': bamFileStoreID, 'sample.mkdups.bam.bai': baiFileStoreID,
+              'sample.intervals': intervalsFileStoreID}
+    inputs.update({key: config[key] for key in
+                   ['genome.fa','genome.fa.fai', 'genome.dict', 'phase.vcf', 'mills.vcf']})
+    get_files_from_filestore(job, work_dir, inputs)
     # Output file path
     outpath = os.path.join(work_dir, 'sample.indel.bam')
     # Call: GATK -- IndelRealigner
@@ -300,27 +321,34 @@ def indel_realignment(job, shared_ids, input_args):
                 work_dir=work_dir, parameters=parameters,
                 inputs=inputs,
                 outputs={'sample.indel.bam': None, 'sample.indel.bai': None},
-                env={'JAVA_OPTS':'-Xmx10g'})
+                env={'JAVA_OPTS':'-Xmx%sg' % memory},
+                mock=config['mock'])
 
     # Write to fileStore
-    shared_ids['sample.indel.bam'] = job.fileStore.writeGlobalFile(outpath)
-    _move_bai(outpath)
-    shared_ids['sample.indel.bam.bai'] = job.fileStore.writeGlobalFile(outpath + ".bai")
-    job.addChildJobFn(base_recalibration, shared_ids, input_args, cores = multiprocessing.cpu_count())
+    bam_id = job.fileStore.writeGlobalFile(outpath)
+    bai_id = job.fileStore.writeGlobalFile(_move_bai(outpath))
+    return bam_id, bai_id
+    # job.addChildJobFn(base_recalibration, shared_ids, input_args, cores = multiprocessing.cpu_count())
 
 
-def base_recalibration(job, shared_ids, input_args):
+def gatk_BaseRecalibrator(job, bamFileStoreID, baiFileStoreID, config):
     """
     Creates recal table to perform Base Quality Score Recalibration
 
     job_vars: tuple     Contains the input_args and ids dictionaries
     sample: str         Either "normal" or "tumor" to track which one is which
     """
+
+    job.fileStore.logToMaster('Running GATK BaseRecalibrator: {}'.format(config['uuid']))
     work_dir = job.fileStore.getLocalTempDir()
     cores = multiprocessing.cpu_count()
+    # TODO Do someting better with allocating memory
+    memory = '10'
     # Retrieve input file paths
-    inputs = ['ref.fa', 'ref.fa.fai', 'ref.dict', 'dbsnp.vcf', 'sample.indel.bam', 'sample.indel.bam.bai']
-    get_files_from_filestore(job, work_dir, shared_ids, *inputs)
+    inputs = {'sample.indel.bam': bamFileStoreID, 'sample.indel.bam.bai': baiFileStoreID}
+    inputs.update({key: config[key] for key in
+                   ['genome.fa','genome.fa.fai', 'genome.dict', 'dbsnp.vcf']})
+    get_files_from_filestore(job, work_dir, inputs)
     # Output file path
     output = os.path.join(work_dir, 'sample.recal.table')
 
@@ -328,39 +356,45 @@ def base_recalibration(job, shared_ids, input_args):
     parameters = ['-U', 'ALLOW_SEQ_DICT_INCOMPATIBILITY', # RISKY! (?) See #189
                   '-T', 'BaseRecalibrator',
                   '-nct', str(cores),
-                  '-R', 'ref.fa',
+                  '-R', 'genome.fa',
                   '-I', 'sample.indel.bam',
                   '-knownSites', 'dbsnp.vcf',
                   '-o', 'sample.recal.table']
     docker_call(tool='quay.io/ucsc_cgl/gatk:3.5--dba6dae49156168a909c43330350c6161dc7ecc2',
                 work_dir=work_dir, parameters=parameters,
-                inputs=inputs,
+                inputs=inputs.keys(),
                 outputs={'sample.recal.table': None},
-                env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']})
+                env={'JAVA_OPTS':'-Xmx%sg' % memory},
+                mock=config['mock'])
     # Write to fileStore
-    shared_ids['sample.recal.table'] = job.fileStore.writeGlobalFile(output)
-    job.addChildJobFn(print_reads, shared_ids, input_args, cores = cores)
+    return job.fileStore.writeGlobalFile(output)
+    # job.addChildJobFn(print_reads, shared_ids, input_args, cores = cores)
 
 
-def print_reads(job, shared_ids, input_args):
+def gatk_PrintReads(job, bamFileStoreID, baiFileStoreID, recalFileStoreID, config):
     """
     Create bam that has undergone Base Quality Score Recalibration (BQSR)
 
     job_vars: tuple     Contains the input_args and ids dictionaries
     sample: str         Either "normal" or "tumor" to track which one is which
     """
-    # Unpack convenience variables for job
-    uuid = input_args['uuid']
-    suffix = input_args['suffix']
+    job.fileStore.logToMaster('Running GATK PrintReads: {}'.format(config['uuid']))
     work_dir = job.fileStore.getLocalTempDir()
     cores = multiprocessing.cpu_count()
+    # TODO Do someting better with allocating memory
+    memory = '10'
     # Retrieve input file paths
-    inputs = ['ref.fa', 'ref.fa.fai', 'ref.dict', 'sample.indel.bam', 'sample.indel.bam.bai', 'sample.recal.table']
-    get_files_from_filestore(job, work_dir, shared_ids, *inputs)
+    inputs = {'sample.indel.bam': bamFileStoreID, 'sample.indel.bam.bai': baiFileStoreID,
+              'recal.table': recalFileStoreID}
+    inputs.update({key: config[key] for key in
+                   ['genome.fa','genome.fa.fai', 'genome.dict']})
+    get_files_from_filestore(job, work_dir, inputs)
     # Output file
+    # Unpack convenience variables for job
+    uuid = config['uuid']
+    suffix = config['suffix'] if config['suffix'] is not None else ''
     outfile = '{}{}.bam'.format(uuid, suffix)
     gatk_outfile_idx = '{}{}.bai'.format(uuid, suffix)
-    outfile_idx = '{}{}.bam.bai'.format(uuid, suffix)
     outpath = os.path.join(work_dir, outfile)
     # Call: GATK -- PrintReads
     parameters = ['-U', 'ALLOW_SEQ_DICT_INCOMPATIBILITY', # RISKY! (?) See #189
@@ -375,11 +409,12 @@ def print_reads(job, shared_ids, input_args):
                 work_dir=work_dir, parameters=parameters,
                 inputs=inputs,
                 outputs={outfile: None, gatk_outfile_idx: None},
-                env={'JAVA_OPTS':'-Xmx%sg' % input_args['memory']})
+                env={'JAVA_OPTS':'-Xmx%sg' % memory},
+                mock=config['mock'])
     
-    upload_or_move(job, work_dir, input_args, outfile)
-    _move_bai(outpath)
-    upload_or_move(job, work_dir, input_args, outfile_idx)
+    upload_or_move(outpath, output_dir=config['output_dir'], s3_dir=config['s3_dir'], s3_key_path=config['ssec'])
+    upload_or_move(_move_bai(outpath), output_dir=config['output_dir'],
+                   s3_dir=config['s3_dir'], s3_key_path=config['ssec'])
 
 def generate_file(file_path, generate_func):
     require(not os.path.exists(file_path), file_path + ' already exists!')
@@ -424,6 +459,9 @@ def generate_config():
 
     # Optional: Provide a suffix for naming output files
     suffix:
+
+    # Optional: Provide a RAM specification
+    memory:
     """[1:])
 
 
@@ -464,11 +502,27 @@ def parse_manifest(path_to_manifest):
                 samples.append(sample)
     return samples
 
-def gatk_preprocessing_pipeline(job, uuid, url, parameters):
-    parameters = parameters.deepcopy()
-    parameters['uuid'] = uuid
-    download = job.wrapJobFn(download_url_job, url, name='sample.bam', s3_key_path=parameters['ssec'])
-    rm_secondary = job.wrapJobFn(remove_supplementary_alignments, download.rv())
+def gatk_preprocessing_pipeline(job, uuid, url, config):
+    config = deepcopy(config)
+    config['uuid'] = uuid
+    download = job.wrapJobFn(download_url_job, url, name='sample.bam', s3_key_path=config['ssec'])
+    rm_secondary = job.wrapJobFn(remove_supplementary_alignments, download.rv(), mock=config['mock'])
+    picard_sort = job.wrapJobFn(picard_SortSam, rm_secondary.rv(), config)
+    mdups = job.wrapJobFn(picard_MarkDuplicates, picard_sort.rv(0), picard_sort.rv(1), config)
+    target = job.wrapJobFn(gatk_RealignerTargetCreator, mdups.rv(0), mdups.rv(1), config)
+    indel = job.wrapJobFn(gatk_IndelRealigner, mdups.rv(0), mdups.rv(1), target.rv(), config)
+    base = job.wrapJobFn(gatk_BaseRecalibrator, indel.rv(0), indel.rv(1), config)
+    print_reads = job.wrapJobFn(gatk_PrintReads, indel.rv(0), indel.rv(1), base.rv(), config)
+
+
+    job.addChild(download)
+    download.addChild(rm_secondary)
+    rm_secondary.addChild(picard_sort)
+    picard_sort.addChild(mdups)
+    mdups.addChild(target)
+    target.addChild(indel)
+    indel.addChild(base)
+    base.addChild(print_reads)
 
 
 def main():
@@ -512,15 +566,14 @@ def main():
     if 'generate' in args.command:
         sys.exit()
     if args.command == 'run':
-        parsed_config = {x.replace('-', '_'): y for x, y in yaml.load(open(args.config).read()).iteritems()}
-        config = argparse.Namespace(**parsed_config)
+        config = {x.replace('-', '_'): y for x, y in yaml.load(open(args.config).read()).iteritems()}
 
-        require(config.genome and config.mills and config.dbsnp and config.phase,
+        require(set(config) > {'genome', 'mills', 'dbsnp', 'phase'},
                 'Missing inputs for preprocessing, check config file')
 
         # Program checks
         for program in ['curl', 'docker']:
-            require(which(program), program + ' must be installed on every node.'.format(program))
+            require(next(which(program)), program + ' must be installed on every node.'.format(program))
 
         if args.bam or args.uuid:
             require(args.bam and args.uuid, '"--bam" and "--uuid" must all be supplied')
@@ -529,12 +582,12 @@ def main():
             samples = parse_manifest(args.manifest)
 
         root = Job.wrapJobFn(download_gatk_files, config)
-        ref_proc = Job.wrapJobFn(reference_preprocessing, root.rv())
+        ref = Job.wrapJobFn(reference_preprocessing, root.rv(), mock=config['mock'])
 
-        root.addFollowOn(ref_proc)
+        root.addFollowOn(ref)
 
         for uuid, url in samples:
-            ref_proc.addFollowOnJobFn(gatk_preprocessing_pipeline, uuid, url, ref_proc.rv())
+            ref.addFollowOnJobFn(gatk_preprocessing_pipeline, uuid, url, ref.rv())
 
         Job.Runner.startToil(root, args)
 

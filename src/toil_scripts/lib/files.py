@@ -1,7 +1,10 @@
 from contextlib import closing
+from bd2k.util.files import mkdir_p
 import os
 import tarfile
 import shutil
+import errno
+import sys
 
 
 def tarball_files(tar_name, file_paths, output_dir='.', prefix=''):
@@ -43,7 +46,10 @@ def copy_to(filename, output_dir, work_dir=None):
     :param output_dir: the output directory
     :param filenames: remaining arguments are filenames
     """
-    if work_dir is None:
+    if os.path.isabs(filename):
+        origin = filename
+        filename = os.path.basename(filename)
+    elif work_dir is None:
         origin = os.path.abspath(filename)
     else:
         origin = os.path.join(work_dir, filename)
@@ -54,6 +60,9 @@ def copy_to(filename, output_dir, work_dir=None):
         if e.errno == errno.ENOTDIR:
             mkdir_p(output_dir)
             shutil.copy(origin, dest)
+        else:
+            raise e
+    assert os.path.exists(dest)
 
 def consolidate_tarballs_job(job, fname_to_id):
     """
