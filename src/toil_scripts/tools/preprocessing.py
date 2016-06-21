@@ -101,6 +101,23 @@ def run_picard_create_sequence_dictionary(job, ref_id):
 
 
 def run_gatk_preprocessing(job, cores, bam, bai, ref, ref_dict, fai, phase, mills, dbsnp, mem='10G'):
+    """
+    Convenience method for grouping together GATK preprocessing
+
+    :param JobFunctionWrappingJob job: passed automatically by Toil
+    :param int cores: Maximum number of cores on a worker node
+    :param str bam: Sample BAM FileStoreID
+    :param str bai: Bam Index FileStoreID
+    :param str ref: Reference genome FileStoreID
+    :param str ref_dict: Reference dictionary FileStoreID
+    :param str fai: Reference index FileStoreID
+    :param str phase: Phase VCF FileStoreID
+    :param str mills: Mills VCF FileStoreID
+    :param str dbsnp: DBSNP VCF FileStoreID
+    :param str mem: Memory value to be passed to children. Needed for CI tests
+    :return: BAM and BAI FileStoreIDs from Print Reads
+    :rtype: tuple(str, str)
+    """
     rtc = job.wrapJobFn(run_realigner_target_creator, cores, bam, bai, ref, ref_dict, fai, phase, mills, mem)
     ir = job.wrapJobFn(run_indel_realignment, rtc.rv(), bam, bai, ref, ref_dict, fai, phase, mills, mem)
     br = job.wrapJobFn(run_base_recalibration, cores, ir.rv(0), ir.rv(1), ref, ref_dict, fai, dbsnp, mem)
@@ -165,7 +182,7 @@ def run_indel_realignment(job, intervals, bam, bai, ref, ref_dict, fai, phase, m
     :param str mills: Mills VCF FileStoreID
     :param str mem: Memory value to be passed to children. Needed for CI tests
     :return: FileStoreID for the processed bam
-    :rtype: str
+    :rtype: tuple(str, str)
     """
     work_dir = job.fileStore.getLocalTempDir()
     file_ids = [ref, fai, ref_dict, intervals, bam, bai, phase, mills]
@@ -240,7 +257,7 @@ def run_print_reads(job, cores, table, indel_bam, indel_bai, ref, ref_dict, fai,
     :param str fai: Reference index FileStoreID
     :param str mem: Memory value to be passed to children. Needed for CI tests
     :return: FileStoreID for the processed bam
-    :rtype: str
+    :rtype: tuple(str, str)
     """
     work_dir = job.fileStore.getLocalTempDir()
     file_ids = [ref, fai, ref_dict, table, indel_bam, indel_bai]
